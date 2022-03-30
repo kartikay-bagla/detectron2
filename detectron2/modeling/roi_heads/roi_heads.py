@@ -875,3 +875,170 @@ class StandardROIHeads(ROIHeads):
         else:
             features = {f: features[f] for f in self.keypoint_in_features}
         return self.keypoint_head(features, instances)
+
+
+@ROI_HEADS_REGISTRY.register()
+class YoloROIHeads(ROIHeads):
+    """
+    Differs from StandardROIHeads in that it only predicts the masks and not boxes.
+    """
+
+    @configurable
+    def __init__(
+        self,
+        *,
+        mask_in_features: List[str],
+        mask_pooler: ROIPooler,
+        mask_head: nn.Module,
+        **kwargs,
+    ):
+        """
+        NOTE: this interface is experimental.
+
+        Args:
+            mask_in_features (list[str]): list of feature names to use for the mask
+                pooler or mask head. None if not using mask head.
+            mask_pooler (ROIPooler): pooler to extract region features from image features.
+                The mask head will then take region features to make predictions.
+                If None, the mask head will directly take the dict of image features
+                defined by `mask_in_features`
+            mask_head (nn.Module): transform features to make mask predictions
+        """
+        super().__init__(**kwargs)
+        self.mask_in_features = mask_in_features
+        self.mask_pooler = mask_pooler
+        self.mask_head = mask_head
+
+    @classmethod
+    def from_config(cls, cfg, input_shape):
+        ret = super().from_config(cfg)
+        # Subclasses that have not been updated to use from_config style construction
+        # may have overridden _init_*_head methods. In this case, those overridden methods
+        # will not be classmethods and we need to avoid trying to call them here.
+        # We test for this with ismethod which only returns True for bound methods of cls.
+        # Such subclasses will need to handle calling their overridden _init_*_head methods.
+        if inspect.ismethod(cls._init_mask_head):
+            ret.update(cls._init_mask_head(cfg, input_shape))
+        return ret
+
+    @classmethod
+    def _init_mask_head(cls, cfg, input_shape):
+        if not cfg.MODEL.MASK_ON:
+            return {}
+        # fmt: off
+        in_features       = cfg.MODEL.ROI_HEADS.IN_FEATURES
+        pooler_resolution = cfg.MODEL.ROI_MASK_HEAD.POOLER_RESOLUTION
+        pooler_scales     = tuple(1.0 / input_shape[k].stride for k in in_features)
+        sampling_ratio    = cfg.MODEL.ROI_MASK_HEAD.POOLER_SAMPLING_RATIO
+        pooler_type       = cfg.MODEL.ROI_MASK_HEAD.POOLER_TYPE
+        # fmt: on
+
+        in_channels = [input_shape[f].channels for f in in_features][0]
+
+        ret = {"mask_in_features": in_features}
+        ret["mask_pooler"] = (
+            ROIPooler(
+                output_size=pooler_resolution,
+                scales=pooler_scales,
+                sampling_ratio=sampling_ratio,
+                pooler_type=pooler_type,
+            )
+            if pooler_type
+            else None
+        )
+        if pooler_type:
+            shape = ShapeSpec(
+                channels=in_channels, width=pooler_resolution, height=pooler_resolution
+            )
+            print("Pooler shape: ", shape)
+        else:
+            shape = {f: input_shape[f] for f in in_features}
+        ret["mask_head"] = build_mask_head(cfg, shape)
+        return ret
+
+    def forward(
+        self,
+        images: ImageList,
+        features: Dict[str, torch.Tensor],
+        proposals: List[Instances],
+        targets: Optional[List[Instances]] = None,
+    ) -> Tuple[List[Instances], Dict[str, torch.Tensor]]:
+        """
+        See :class:`ROIHeads.forward`.
+        """
+        del images
+        if self.training:
+            assert targets, "'targets' argument is required during training"
+            proposals = self.label_and_sample_proposals(proposals, targets)
+        del targets
+
+        if self.training:
+            losses = self._forward_mask(features, proposals)
+            return proposals, losses
+        else:
+            # During inference cascaded prediction is used: the mask and keypoints heads are only
+            # applied to the top scoring box detections.
+            pred_instances = self.forward_with_given_boxes(features, proposals)
+            return pred_instances, {}
+
+    def forward_with_given_boxes(
+        self, features: Dict[str, torch.Tensor], instances: List[Instances]
+    ) -> List[Instances]:
+        """
+        Use the given boxes in `instances` to produce other (non-box) per-ROI outputs.
+
+        This is useful for downstream tasks where a box is known, but need to obtain
+        other attributes (outputs of other heads).
+        Test-time augmentation also uses this.
+
+        Args:
+            features: same as in `forward()`
+            instances (list[Instances]): instances to predict other outputs. Expect the keys
+                "pred_boxes" and "pred_classes" to exist.
+
+        Returns:
+            list[Instances]:
+                the same `Instances` objects, with extra
+                fields such as `pred_masks` or `pred_keypoints`.
+        """
+        assert not self.training
+        assert instances[0].has("pred_boxes") and instances[0].has("pred_classes")
+
+        instances = self._forward_mask(features, instances)
+        return instances
+
+    def _forward_mask(self, features: Dict[str, torch.Tensor], instances: List[Instances]):
+        """
+        Forward logic of the mask prediction branch.
+
+        Args:
+            features (dict[str, Tensor]): mapping from feature map names to tensor.
+                Same as in :meth:`ROIHeads.forward`.
+            instances (list[Instances]): the per-image instances to train/predict masks.
+                In training, they can be the proposals.
+                In inference, they can be the boxes predicted by R-CNN box head.
+
+        Returns:
+            In training, a dict of losses.
+            In inference, update `instances` with new fields "pred_masks" and return it.
+        """
+        if not self.mask_on:
+            return {} if self.training else instances
+
+        if self.training:
+            # head is only trained on positive proposals.
+            instances, _ = select_foreground_proposals(instances, self.num_classes)
+
+        if self.mask_pooler is not None:
+            features = [features[f] for f in self.mask_in_features]
+            boxes = [x.proposal_boxes if self.training else x.pred_boxes for x in instances]
+            print([len(b) for b in boxes])
+            for feat in features:
+                print("roi input features", feat.shape)
+            features = self.mask_pooler(features, boxes)
+            print("roi output features", features.shape)
+            import sys
+            sys.exit()
+        else:
+            features = {f: features[f] for f in self.mask_in_features}
+        return self.mask_head(features, instances)
