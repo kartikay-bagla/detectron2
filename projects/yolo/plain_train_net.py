@@ -33,6 +33,7 @@ from detectron2.data import (
     build_detection_test_loader,
     build_detection_train_loader,
 )
+from detectron2.data import DatasetMapper
 from detectron2.engine import default_argument_parser, default_setup, default_writers, launch
 from detectron2.evaluation import (
     CityscapesInstanceEvaluator,
@@ -52,6 +53,8 @@ from detectron2.utils.events import EventStorage
 
 import yolo
 import darthyolo
+
+import detectron2.data.transforms as T
 
 logger = logging.getLogger("detectron2")
 
@@ -99,7 +102,14 @@ def get_evaluator(cfg, dataset_name, output_folder=None):
 def do_test(cfg, model):
     results = OrderedDict()
     for dataset_name in cfg.DATASETS.TEST:
-        data_loader = build_detection_test_loader(cfg, dataset_name)
+        data_loader = build_detection_test_loader(
+            cfg, dataset_name,
+            mapper=DatasetMapper(
+                cfg, is_train=False, 
+                augmentations=[T.Resize((640, 640))], 
+                use_instance_mask=True
+            )
+        )
         evaluator = get_evaluator(
             cfg, dataset_name, os.path.join(cfg.OUTPUT_DIR, "inference", dataset_name)
         )
@@ -134,7 +144,15 @@ def do_train(cfg, model, resume=False):
 
     # compared to "train_net.py", we do not support accurate timing and
     # precise BN here, because they are not trivial to implement in a small training loop
-    data_loader = build_detection_train_loader(cfg)
+    data_loader = build_detection_train_loader(
+        cfg,
+        mapper=DatasetMapper(
+            cfg, is_train=True, 
+            augmentations=[
+                T.Resize((640, 640))
+            ], use_instance_mask=True
+        )
+    )
     logger.info("Starting training from iteration {}".format(start_iter))
     with EventStorage(start_iter) as storage:
         for data, iteration in zip(data_loader, range(start_iter, max_iter)):

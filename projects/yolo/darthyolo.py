@@ -7,7 +7,7 @@ import inspect
 from detectron2.config import configurable
 from detectron2.data.detection_utils import convert_image_to_rgb
 from detectron2.layers import ShapeSpec
-from detectron2.structures import ImageList, Instances
+from detectron2.structures import ImageList, Instances, Boxes
 from detectron2.utils.events import get_event_storage
 
 from detectron2.modeling.backbone import Backbone, build_backbone
@@ -15,8 +15,9 @@ from detectron2.modeling.postprocessing import detector_postprocess
 from detectron2.modeling.roi_heads import build_roi_heads
 from detectron2.modeling import META_ARCH_REGISTRY, ROI_HEADS_REGISTRY
 from detectron2.modeling.poolers import ROIPooler
+from detectron2.modeling.roi_heads import MaskRCNNConvUpsampleHead
 from detectron2.modeling.roi_heads.mask_head import build_mask_head
-from detectron2.modeling.roi_heads.roi_heads import ROIHeads
+from detectron2.modeling.roi_heads.roi_heads import ROIHeads, select_foreground_proposals
 
 
 @META_ARCH_REGISTRY.register()
@@ -32,7 +33,6 @@ class DarthYOLO(nn.Module):
         self,
         *,
         backbone: Backbone,
-        proposal_generator: nn.Module,
         roi_heads: nn.Module,
         pixel_mean: Tuple[float],
         pixel_std: Tuple[float],
@@ -42,7 +42,6 @@ class DarthYOLO(nn.Module):
         """
         Args:
             backbone: a backbone module, must follow detectron2's backbone interface
-            proposal_generator: a module that generates proposals using backbone features
             roi_heads: a ROI head that performs per-region computation
             pixel_mean, pixel_std: list or tuple with #channels element, representing
                 the per-channel mean and std to be used to normalize the input image
@@ -51,7 +50,6 @@ class DarthYOLO(nn.Module):
         """
         super().__init__()
         self.backbone = backbone
-        self.proposal_generator = proposal_generator
         self.roi_heads = roi_heads
 
         self.input_format = input_format
@@ -152,6 +150,20 @@ class DarthYOLO(nn.Module):
         # calculate proposal_losses here aka yolo loss
         proposals, features, _ = self.backbone(images.tensor)
 
+        final_proposals = []
+        for i in range(len(images)):
+            image = images[i]
+            _, h, w = image.shape
+            boxes = Boxes(proposals[i][:, :4])
+            final_proposals.append(
+                Instances(
+                    (h, w), 
+                    objectness_logits=proposals[i][:, 4],
+                    proposal_boxes=boxes
+                )
+            )
+        proposals = final_proposals
+
         _, detector_losses = self.roi_heads(images, features, proposals, gt_instances)
         if self.vis_period > 0:
             storage = get_event_storage()
@@ -238,9 +250,18 @@ class YoloROIHeads(ROIHeads):
     def __init__(
         self,
         *,
-        mask_in_features: List[str],
-        mask_pooler: ROIPooler,
-        mask_head: nn.Module,
+        mask_in_features: List[str] = ["p1", "p2", "p3"],
+        mask_pooler: ROIPooler = ROIPooler(
+            output_size=14,
+            scales=(1.0 / 4, 1.0 / 8, 1.0 / 16),
+            sampling_ratio=0,
+            pooler_type="ROIAlignV2",
+        ),
+        mask_head: nn.Module = MaskRCNNConvUpsampleHead(
+            input_shape=ShapeSpec(channels=256, width=14, height=14),
+            num_classes=80,
+            conv_dims=[256, 256, 256, 256, 256],
+        ),
         **kwargs,
     ):
         """
@@ -373,8 +394,6 @@ class YoloROIHeads(ROIHeads):
             In training, a dict of losses.
             In inference, update `instances` with new fields "pred_masks" and return it.
         """
-        if not self.mask_on:
-            return {} if self.training else instances
 
         if self.training:
             # head is only trained on positive proposals.
@@ -388,8 +407,6 @@ class YoloROIHeads(ROIHeads):
                 print("roi input features", feat.shape)
             features = self.mask_pooler(features, boxes)
             print("roi output features", features.shape)
-            import sys
-            sys.exit()
         else:
             features = {f: features[f] for f in self.mask_in_features}
         return self.mask_head(features, instances)

@@ -1,11 +1,12 @@
 import math
 
 from detectron2.modeling  import BACKBONE_REGISTRY
+from detectron2.modeling.backbone import Backbone
 
-from .utils.google_utils import *
-from .utils.layers import *
-from .utils.parse_config import *
-from .utils import torch_utils
+from utils.google_utils import *
+from utils.layers import *
+from utils.parse_config import *
+from utils import torch_utils
 
 ONNX_EXPORT = False
 
@@ -258,10 +259,8 @@ class YOLOLayer(nn.Module):
         self.nx, self.ny = ng  # x and y grid size
         self.ng = torch.tensor(ng, dtype=torch.float)
 
-        # build xy offsets
-        if not self.training:
-            yv, xv = torch.meshgrid([torch.arange(self.ny, device=device), torch.arange(self.nx, device=device)])
-            self.grid = torch.stack((xv, yv), 2).view((1, 1, self.ny, self.nx, 2)).float()
+        yv, xv = torch.meshgrid([torch.arange(self.ny, device=device), torch.arange(self.nx, device=device)])
+        self.grid = torch.stack((xv, yv), 2).view((1, 1, self.ny, self.nx, 2)).float()
 
         if self.anchor_vec.device != device:
             self.anchor_vec = self.anchor_vec.to(device)
@@ -298,34 +297,12 @@ class YOLOLayer(nn.Module):
         # p.view(bs, 255, 13, 13) -- > (bs, 3, 13, 13, 85)  # (bs, anchors, grid, grid, classes + xywh)
         p = p.view(bs, self.na, self.no, self.ny, self.nx).permute(0, 1, 3, 4, 2).contiguous()  # prediction
 
-        if self.training:
-            return p
+        io = p.sigmoid()
+        io[..., :2] = (io[..., :2] * 2. - 0.5 + self.grid)
+        io[..., 2:4] = (io[..., 2:4] * 2) ** 2 * self.anchor_wh
+        io[..., :4] *= self.stride
+        return io.view(bs, -1, self.no), p  # view [1, 3, 13, 13, 85] as [1, 507, 85]
 
-        elif ONNX_EXPORT:
-            # Avoid broadcasting for ANE operations
-            m = self.na * self.nx * self.ny
-            ng = 1. / self.ng.repeat(m, 1)
-            grid = self.grid.repeat(1, self.na, 1, 1, 1).view(m, 2)
-            anchor_wh = self.anchor_wh.repeat(1, 1, self.nx, self.ny, 1).view(m, 2) * ng
-
-            p = p.view(m, self.no)
-            xy = torch.sigmoid(p[:, 0:2]) + grid  # x, y
-            wh = torch.exp(p[:, 2:4]) * anchor_wh  # width, height
-            p_cls = torch.sigmoid(p[:, 4:5]) if self.nc == 1 else \
-                torch.sigmoid(p[:, 5:self.no]) * torch.sigmoid(p[:, 4:5])  # conf
-            return p_cls, xy * ng, wh
-
-        else:  # inference
-            io = p.sigmoid()
-            io[..., :2] = (io[..., :2] * 2. - 0.5 + self.grid)
-            io[..., 2:4] = (io[..., 2:4] * 2) ** 2 * self.anchor_wh
-            io[..., :4] *= self.stride
-            #io = p.clone()  # inference output
-            #io[..., :2] = torch.sigmoid(io[..., :2]) + self.grid  # xy
-            #io[..., 2:4] = torch.exp(io[..., 2:4]) * self.anchor_wh  # wh yolo method
-            #io[..., :4] *= self.stride
-            #torch.sigmoid_(io[..., 4:])
-            return io.view(bs, -1, self.no), p  # view [1, 3, 13, 13, 85] as [1, 507, 85]
 
 class Darknet(nn.Module):
     # YOLOv3 object detection model
@@ -343,9 +320,9 @@ class Darknet(nn.Module):
         self.seen = np.array([0], dtype=np.int64)  # (int64) number of images seen during training
 
         self.output_layers = {
-            "p1": 53,
-            "p2": 84,
-            "p3": 103,
+            "p1": 54,
+            "p2": 83,
+            "p3": 117,
         }
 
     def forward(self, x):
@@ -473,6 +450,18 @@ class Darknet(nn.Module):
 def get_yolo_layers(model):
     return [i for i, m in enumerate(model.module_list) if m.__class__.__name__ in ['YOLOLayer', 'JDELayer']]  # [89, 101, 113]
 
+class YOLOBackbone(Backbone):
+    def __init__(self, cfg, input_shape):
+        super(YOLOBackbone, self).__init__()
+        self.model = Darknet(cfg, input_shape)
+        self.model.load_darknet_weights("yolov4.weights")
+        self._out_features = ["p1", "p2", "p3"]
+        self._out_feature_channels = {"p1": 256, "p2": 512, "p3": 1024}
+        self._out_feature_strides = {"p1": 4, "p2": 8, "p3": 16}
+
+    def forward(self, x):
+        return self.model(x)
+
 @BACKBONE_REGISTRY.register()
 def build_yolo_backbone(cfg, input_shape):
-    return Darknet("yolov4.cfg", (input_shape.width, input_shape.height))
+    return YOLOBackbone("yolov4.cfg", (input_shape.width, input_shape.height))
