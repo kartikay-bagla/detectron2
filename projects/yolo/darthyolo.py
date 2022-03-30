@@ -402,11 +402,7 @@ class YoloROIHeads(ROIHeads):
         if self.mask_pooler is not None:
             features = [features[f] for f in self.mask_in_features]
             boxes = [x.proposal_boxes if self.training else x.pred_boxes for x in instances]
-            print([len(b) for b in boxes])
-            for feat in features:
-                print("roi input features", feat.shape)
             features = self.mask_pooler(features, boxes)
-            print("roi output features", features.shape)
         else:
             features = {f: features[f] for f in self.mask_in_features}
         return self.mask_head(features, instances)
