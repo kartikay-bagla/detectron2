@@ -1,6 +1,6 @@
 import math
 
-from .build import BACKBONE_REGISTRY
+from detectron2.modeling  import BACKBONE_REGISTRY
 
 from .utils.google_utils import *
 from .utils.layers import *
